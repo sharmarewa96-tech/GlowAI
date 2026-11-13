@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.streamlit/secrets.toml
+credentials.toml
+app_backup.py
+app_pre_*.py
+apply_patch_*.py
+check_*.py
+.streamlit/credentials.toml
+.streamlit/secrets.toml
