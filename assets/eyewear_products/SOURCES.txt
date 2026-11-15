@@ -1,0 +1,10 @@
+Frame-only photo asset sources
+
+Cat-eye (cat_eye.jpg): https://www.eyebobs.com/collections/all-frames/products/3589-favorite-aunt
+Rectangle (rectangle.jpg): https://www.eyebobs.com/collections/fancy-readers-glasses/products/2227-on-board
+Round (round.jpg): https://www.ebay.de/itm/353068064840 (direct product photo: i.ebayimg.com/images/g/OysAAOSwtQ5er8Xm/s-l1200.jpg)
+Oval (oval.jpg): https://www.choiceeyewear.com/products/fmf7014
+Aviator (aviator.webp): https://www.wmpeyewear.com/products/maxwell-prescription
+Square and clear acetate (square.jpg): https://www.eyebobs.com/products/3448-look-see
+
+These photos are local product-style references for the recommendation cards. They are not the eyewear virtual try-on result.
