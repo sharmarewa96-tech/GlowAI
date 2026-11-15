@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import html
 from io import BytesIO
 import os
@@ -111,6 +112,10 @@ if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 if "last_uploaded_name" not in st.session_state:
     st.session_state.last_uploaded_name = None
+if "last_camera_capture_digest" not in st.session_state:
+    st.session_state.last_camera_capture_digest = None
+if "camera_analysis_attempted" not in st.session_state:
+    st.session_state.camera_analysis_attempted = False
 if "original_image" not in st.session_state:
     st.session_state.original_image = None
 if "mesh_image" not in st.session_state:
@@ -176,6 +181,8 @@ def reset_all_visage_state():
     st.session_state.staged_image = None
     st.session_state.staged_image_source = None
     st.session_state.last_uploaded_name = None
+    st.session_state.last_camera_capture_digest = None
+    st.session_state.camera_analysis_attempted = False
     st.session_state.original_image = None
     st.session_state.mesh_image = None
     st.session_state.geometry = {}
@@ -1626,14 +1633,21 @@ if "Overview / Studio" in st.session_state.active_studio_name:
             )
             if camera_pic is not None:
                 try:
-                    camera_pic.seek(0)
-                    img_cam = ImageOps.exif_transpose(Image.open(camera_pic)).convert("RGB")
-                    img_cam.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
-                    st.session_state.staged_image = img_cam.copy()
-                    st.session_state.staged_image_source = "Live Camera Capture"
-                    st.rerun()
+                    camera_bytes = camera_pic.getvalue()
+                    capture_digest = hashlib.sha256(camera_bytes).hexdigest()
+                    if capture_digest != st.session_state.last_camera_capture_digest:
+                        camera_pic.seek(0)
+                        img_cam = ImageOps.exif_transpose(Image.open(camera_pic)).convert("RGB")
+                        img_cam.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
+                        st.session_state.staged_image = img_cam.copy()
+                        st.session_state.staged_image_source = "Live Camera Capture"
+                        st.session_state.last_camera_capture_digest = capture_digest
+                        st.session_state.camera_analysis_attempted = False
                 except Exception as exc:
                     st.error(f"Could not load camera photo: {exc}")
+            elif st.session_state.staged_image_source == "Live Camera Capture":
+                # Streamlit's camera clear/retake action clears both the widget and staged portrait.
+                reset_all_visage_state()
         with tab_demo:
             st.markdown(
                 """
@@ -1682,12 +1696,20 @@ if "Overview / Studio" in st.session_state.active_studio_name:
                     """,
                     unsafe_allow_html=True,
                 )
-                if st.button(
+                auto_camera_analysis = (
+                    st.session_state.staged_image_source == "Live Camera Capture"
+                    and not st.session_state.camera_analysis_attempted
+                )
+                if auto_camera_analysis:
+                    # Analyze this captured image once; a later Streamlit rerun must not restart it.
+                    st.session_state.camera_analysis_attempted = True
+                run_manual_analysis = st.button(
                     "✨ Execute Facial Architecture Analysis",
                     type="primary",
                     use_container_width=True,
                     key="btn_run_analysis_action",
-                ):
+                )
+                if auto_camera_analysis or run_manual_analysis:
                     with st.spinner("Processing facial geometry & optical color metrics..."):
                         res_data, err_msg = analyze_portrait_landmarks(st.session_state.staged_image)
                         if err_msg:
@@ -1783,8 +1805,35 @@ if "Overview / Studio" in st.session_state.active_studio_name:
                 st.rerun()
 
 elif "Face & Color Analysis" in st.session_state.active_studio_name:
+    if not st.session_state.analyzed and st.session_state.staged_image is not None:
+        try:
+            with st.spinner("Analyzing your saved portrait with MediaPipe FaceMesh..."):
+                res_data, err_msg = analyze_portrait_landmarks(st.session_state.staged_image)
+            if err_msg:
+                st.error(err_msg)
+            else:
+                orig_p, mesh_p, geom_p, col_p = res_data
+                st.session_state.original_image = orig_p
+                st.session_state.mesh_image = mesh_p
+                st.session_state.geometry = geom_p
+                st.session_state.color_data = col_p
+                st.session_state.analyzed = True
+        except Exception as exc:
+            st.error(f"Portrait analysis could not complete: {exc}")
+    if (
+        not st.session_state.analyzed
+        and st.session_state.original_image is not None
+        and st.session_state.mesh_image is not None
+        and st.session_state.geometry
+        and st.session_state.color_data
+    ):
+        # Keep complete saved results usable if a session's analyzed flag was lost.
+        st.session_state.analyzed = True
     if not st.session_state.analyzed:
-        st.info("Please scan or upload a portrait in 'Overview / Studio' first to enable real-time face and color analysis.")
+        if st.session_state.staged_image is None and st.session_state.original_image is None:
+            st.info("Please scan or upload a portrait in 'Overview / Studio' first to enable real-time face and color analysis.")
+        else:
+            st.error("Your portrait is available, but its analysis could not be completed. Return to Overview / Studio and try the analysis again.")
     else:
         geom = st.session_state.geometry
         color = st.session_state.color_data
