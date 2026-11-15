@@ -129,6 +129,34 @@ if "selected_concerns" not in st.session_state:
     st.session_state.selected_concerns = ["Barrier Repair", "Dehydration"]
 if "budget_tier" not in st.session_state:
     st.session_state.budget_tier = "Curated Mid ($32 – $58)"
+for _prefix in ("hair", "eyewear"):
+    st.session_state.setdefault(f"{_prefix}_upload_key", 0)
+    st.session_state.setdefault(f"{_prefix}_image", None)
+    st.session_state.setdefault(f"{_prefix}_source", "")
+    if _prefix == "hair":
+        st.session_state.setdefault("hair_try_style", "")
+for _key, _value in {
+    "hair_selected_name": "", "hair_selected_style": "", "hair_comparison": "Side-by-side",
+    "eyewear_selected_name": "",
+}.items():
+    st.session_state.setdefault(_key, _value)
+if "virtual_makeup_upload_key" not in st.session_state:
+    st.session_state.virtual_makeup_upload_key = 0
+if "virtual_makeup_image" not in st.session_state:
+    st.session_state.virtual_makeup_image = None
+if "virtual_makeup_source" not in st.session_state:
+    st.session_state.virtual_makeup_source = ""
+for _makeup_key, _makeup_default in {
+    "makeup_lipstick": "Rosewood Nude",
+    "makeup_blush": "Peach Bloom",
+    "makeup_blush_placement": "Lifted sweep",
+    "makeup_eyeshadow": "Soft Rose",
+    "makeup_eyeliner": "Soft definition",
+    "makeup_intensity": 65,
+    "makeup_comparison": "Side-by-side",
+}.items():
+    if _makeup_key not in st.session_state:
+        st.session_state[_makeup_key] = _makeup_default
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
 else:
@@ -836,6 +864,338 @@ def generate_sample_portrait():
     draw.chord([195, 362, 285, 385], 180, 360, fill=(195, 90, 108))
     return img
 
+@st.cache_data(show_spinner=False, max_entries=4)
+def _cached_makeup_face_points(image_bytes: bytes):
+    """Detect a face once per uploaded image and cache its refined FaceMesh points."""
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    rgb = np.asarray(image)
+    face_mesh_module = mp.solutions.face_mesh
+    with face_mesh_module.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.45,
+    ) as detector:
+        result = detector.process(rgb)
+    if not result.multi_face_landmarks:
+        return None
+    height, width = rgb.shape[:2]
+    return [[lm.x * width, lm.y * height] for lm in result.multi_face_landmarks[0].landmark]
+
+
+def _hex_rgb(color: str):
+    value = color.lstrip("#")
+    return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))
+
+
+def _landmark_polygon_mask(shape, points, indices, blur_fraction=0.006):
+    height, width = shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+    polygon = np.asarray([points[index] for index in indices], dtype=np.float32)
+    polygon[:, 0] = np.clip(polygon[:, 0], 0, width - 1)
+    polygon[:, 1] = np.clip(polygon[:, 1], 0, height - 1)
+    cv2.fillPoly(mask, [np.round(polygon).astype(np.int32)], 255, lineType=cv2.LINE_AA)
+    sigma = max(1.0, min(width, height) * blur_fraction)
+    return cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma, sigmaY=sigma).astype(np.float32) / 255.0
+
+
+def _blend_cosmetic_tint(rgb, mask, color, strength, saturation_boost=1.0, darken=0.0):
+    """Tint a feathered mask in HSV while retaining the source image's shading."""
+    if strength <= 0 or not np.any(mask > 0.01):
+        return rgb
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    target = cv2.cvtColor(np.uint8([[list(_hex_rgb(color))]]), cv2.COLOR_RGB2HSV)[0, 0].astype(np.float32)
+    alpha = np.clip(mask * strength, 0.0, 0.92)
+    source_hue = hsv[:, :, 0]
+    delta = ((target[0] - source_hue + 90.0) % 180.0) - 90.0
+    hsv[:, :, 0] = (source_hue + delta * alpha) % 180.0
+    desired_saturation = np.maximum(hsv[:, :, 1], target[1] * saturation_boost)
+    hsv[:, :, 1] = hsv[:, :, 1] * (1.0 - alpha) + desired_saturation * alpha
+    hsv[:, :, 2] *= 1.0 - alpha * darken
+    return cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+
+def _virtual_makeup_preview(image, points, lipstick, blush, blush_placement, eyeshadow, eyeliner, intensity):
+    """Apply soft, feature-aligned lipstick, blush, eyeshadow, and optional liner."""
+    source = np.asarray(image.convert("RGB")).copy()
+    height, width = source.shape[:2]
+    points = np.asarray(points, dtype=np.float32)
+    level = float(intensity) / 100.0
+
+    outer_lip = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146]
+    inner_lip = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191]
+    lip_mask = np.zeros((height, width), dtype=np.uint8)
+    for contour in (outer_lip,):
+        polygon = np.round(points[contour]).astype(np.int32)
+        cv2.fillPoly(lip_mask, [polygon], 255, lineType=cv2.LINE_AA)
+    inner_polygon = np.round(points[inner_lip]).astype(np.int32)
+    cv2.fillPoly(lip_mask, [inner_polygon], 0)
+    lip_sigma = max(1.0, min(width, height) * 0.003)
+    lip_mask = cv2.GaussianBlur(lip_mask, (0, 0), lip_sigma).astype(np.float32) / 255.0
+    source = _blend_cosmetic_tint(source, lip_mask, lipstick, 0.78 * level, saturation_boost=0.88, darken=0.08)
+
+    # Cheek centers use FaceMesh cheek-region landmarks; placement changes their position.
+    cheek_centers = [
+        points[117] * 0.62 + points[50] * 0.38,
+        points[346] * 0.62 + points[280] * 0.38,
+    ]
+    face_length = max(float(np.linalg.norm(points[10] - points[152])), 1.0)
+    face_width = max(float(np.linalg.norm(points[234] - points[454])), 1.0)
+    if blush_placement == "Lifted sweep":
+        cheek_centers[0] = cheek_centers[0] * 0.72 + points[234] * 0.28
+        cheek_centers[1] = cheek_centers[1] * 0.72 + points[454] * 0.28
+        cheek_centers[0][1] -= face_length * 0.025
+        cheek_centers[1][1] -= face_length * 0.025
+    elif blush_placement == "Soft drape":
+        cheek_centers[0][1] += face_length * 0.018
+        cheek_centers[1][1] += face_length * 0.018
+    blush_mask = np.zeros((height, width), dtype=np.uint8)
+    radius_x = max(10, int(face_width * (0.14 if blush_placement == "Soft apples" else 0.16)))
+    radius_y = max(7, int(face_length * 0.055))
+    cheek_axis = points[454] - points[234]
+    cheek_angle = float(np.degrees(np.arctan2(cheek_axis[1], cheek_axis[0])))
+    for center in cheek_centers:
+        cv2.ellipse(
+            blush_mask,
+            tuple(np.round(center).astype(int)),
+            (radius_x, radius_y),
+            cheek_angle,
+            0,
+            360,
+            255,
+            -1,
+            lineType=cv2.LINE_AA,
+        )
+    blush_mask = cv2.GaussianBlur(blush_mask, (0, 0), max(2.0, min(width, height) * 0.012)).astype(np.float32) / 255.0
+    source = _blend_cosmetic_tint(source, blush_mask, blush, 0.68 * level, saturation_boost=0.82, darken=0.02)
+
+    upper_eye_paths = ([33, 246, 161, 160, 159, 158, 157, 173, 133], [263, 466, 388, 387, 386, 385, 384, 398, 362])
+    shadow_mask = np.zeros((height, width), dtype=np.uint8)
+    band_offset = max(4.0, face_length * 0.045)
+    for path in upper_eye_paths:
+        lid = points[path].copy()
+        raised = lid.copy()
+        raised[:, 1] -= band_offset
+        band = np.vstack((lid, raised[::-1]))
+        cv2.fillPoly(shadow_mask, [np.round(band).astype(np.int32)], 255, lineType=cv2.LINE_AA)
+    shadow_mask = cv2.GaussianBlur(shadow_mask, (0, 0), max(1.0, min(width, height) * 0.004)).astype(np.float32) / 255.0
+    source = _blend_cosmetic_tint(source, shadow_mask, eyeshadow, 0.48 * level, saturation_boost=0.66, darken=0.04)
+
+    if eyeliner != "None":
+        liner_mask = np.zeros((height, width), dtype=np.uint8)
+        thickness = max(2, int(face_width * 0.006))
+        for path, outer_index, inner_index in ((upper_eye_paths[0], 33, 133), (upper_eye_paths[1], 263, 362)):
+            curve = np.round(points[path]).astype(np.int32).reshape((-1, 1, 2))
+            cv2.polylines(liner_mask, [curve], False, 255, thickness=thickness, lineType=cv2.LINE_AA)
+            if eyeliner == "Classic wing":
+                outer = points[outer_index]
+                inner = points[inner_index]
+                outward = outer - inner
+                norm = max(float(np.linalg.norm(outward)), 1.0)
+                wing = outer + outward / norm * (face_width * 0.045)
+                wing[1] -= face_length * 0.025
+                cv2.line(liner_mask, tuple(np.round(outer).astype(int)), tuple(np.round(wing).astype(int)), 255, thickness=thickness, lineType=cv2.LINE_AA)
+        liner_mask = cv2.GaussianBlur(liner_mask, (0, 0), max(0.8, thickness * 0.55)).astype(np.float32) / 255.0
+        source = _blend_cosmetic_tint(source, liner_mask, "#34232B", 0.92 * level, saturation_boost=0.9, darken=0.12)
+
+    return Image.fromarray(source)
+
+
+def _reset_virtual_makeup():
+    st.session_state.virtual_makeup_image = None
+    st.session_state.virtual_makeup_source = ""
+    st.session_state.virtual_makeup_upload_key += 1
+    st.session_state.makeup_lipstick = "Rosewood Nude"
+    st.session_state.makeup_blush = "Peach Bloom"
+    st.session_state.makeup_blush_placement = "Lifted sweep"
+    st.session_state.makeup_eyeshadow = "Soft Rose"
+    st.session_state.makeup_eyeliner = "Soft definition"
+    st.session_state.makeup_intensity = 65
+    st.session_state.makeup_comparison = "Side-by-side"
+
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _cached_style_face_points(image_bytes: bytes):
+    """Detect refined FaceMesh landmarks locally for portrait styling."""
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    rgb = np.asarray(image)
+    with mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.45) as detector:
+        result = detector.process(rgb)
+    if not result.multi_face_landmarks:
+        return None
+    h, w = rgb.shape[:2]
+    return [[lm.x * w, lm.y * h] for lm in result.multi_face_landmarks[0].landmark]
+
+
+def _estimate_style_face_shape(points):
+    p = np.asarray(points, dtype=np.float32)
+    ratio = float(np.linalg.norm(p[10] - p[152]) / max(np.linalg.norm(p[234] - p[454]), 1.0))
+    jaw = float(np.linalg.norm(p[172] - p[397]) / max(np.linalg.norm(p[234] - p[454]), 1.0))
+    upper = float(np.linalg.norm(p[54] - p[284]) / max(np.linalg.norm(p[234] - p[454]), 1.0))
+    if ratio >= 1.36: return "Oblong / Long"
+    if jaw < 0.78 and upper > 1.02: return "Heart"
+    if jaw < 0.76: return "Diamond"
+    if ratio <= 1.08 and jaw >= 0.88: return "Square"
+    if ratio <= 1.08: return "Round"
+    return "Oval / Balanced"
+
+
+
+def _face_shape_explanation(shape):
+    return {
+        "Round":"A softly curved outline with similar face length and width; styling can add gentle vertical or angular contrast.",
+        "Square":"A broad outline with a more defined jaw; softly rounded details can balance the angles.",
+        "Oblong / Long":"A longer face proportion; lateral movement and frame height can add visual balance.",
+        "Heart":"A broader upper face with a narrower lower outline; lighter shapes near the temples keep proportions balanced.",
+        "Diamond":"Cheekbones read widest, with a narrower forehead and jaw; softer lines can complement the cheek area.",
+        "Oval / Balanced":"Face length and width appear balanced, leaving room to explore a wide range of proportions.",
+    }.get(shape,"An approximate front-view proportion estimate. Pose, lighting, and expression can affect the result.")
+
+
+def _style_recommendations(shape, category):
+    """Return exactly three informative, face-shape-specific options with photo assets."""
+    key=shape.lower()
+    if category=="hair":
+        # Existing local portrait photos represent three distinct, real hair silhouettes.
+        if "round" in key:
+            return [
+                ("Long Face-Framing Layers","The longer, softly parted outline adds a lengthening line while keeping movement around the cheeks.","Long","Loose, face-framing waves with blended layers.","Moderate","model_5.png","long"),
+                ("Shoulder-Length Soft Waves","A side part and movement below the cheekbones create a light diagonal and balanced width.","Shoulder length","Airy, brushed-out waves with a side part.","Moderate","model_3.png","waves"),
+                ("Soft Low Chignon","A clean, low gathered shape keeps the crown from feeling overly tall and leaves the jawline open.","Updo","Polished low bun with soft face-framing tendrils.","Low","model_2.png","chignon"),
+            ]
+        if "oblong" in key or "long" in key:
+            return [
+                ("Shoulder-Length Soft Waves","Side volume and a shoulder-grazing finish add width and soften a longer outline.","Shoulder length","Loose waves with fullness through the sides.","Moderate","model_3.png","waves"),
+                ("Long Butterfly Layers","Wide, feathered face-framing layers add movement without pulling the silhouette upward.","Long","Long layers with softly flipped, airy ends.","Moderate","model_5.png","long"),
+                ("Soft Low Chignon","A low, softly textured updo keeps the silhouette balanced and avoids extra height at the crown.","Updo","Low chignon with relaxed tendrils around the face.","Low","model_2.png","chignon"),
+            ]
+        if "heart" in key or "diamond" in key:
+            return [
+                ("Collarbone Face-Framing Layers","Movement that begins around the jaw can balance a narrower lower face while keeping the cheek area light.","Long to collarbone","Soft layers with gentle bends through the ends.","Moderate","model_5.png","long"),
+                ("Shoulder-Length Soft Waves","A side-swept part and soft waves create a flattering diagonal around the cheekbones.","Shoulder length","Loose side-parted waves with a light finish.","Moderate","model_3.png","waves"),
+                ("Soft Low Chignon","A relaxed low updo lets the cheekbones show while keeping the temple area soft.","Updo","Low bun with fine tendrils and soft texture.","Low","model_2.png","chignon"),
+            ]
+        return [
+            ("Long Butterfly Layers","Feathered lengths add movement around balanced proportions and draw attention to the cheekbones.","Long","Long, flowing layers with softly waved ends.","Moderate","model_5.png","long"),
+            ("Shoulder-Length Soft Waves","A versatile shoulder-grazing silhouette frames the eyes while keeping natural proportions visible.","Shoulder length","Brushed-out waves with a soft side part.","Moderate","model_3.png","waves"),
+            ("Soft Low Chignon","A polished low updo offers an elegant alternative that highlights the face without excess crown height.","Updo","Relaxed low bun with gentle face-framing pieces.","Low","model_2.png","chignon"),
+        ]
+    if "round" in key:
+        return [
+            ("Angular Rectangle","Crisp outer corners bring definition and contrast to rounded contours.","Rectangle · full acetate rim","Espresso, tortoise, or rose crystal","Rectangle"),
+            ("Lifted Cat-Eye","An upswept outer edge creates a flattering diagonal and draws attention toward the temples.","Cat-eye · sculpted upper rim","Burgundy, champagne, or black","Cat-eye"),
+            ("Transparent Square","A defined lens shape gives gentle structure while pale acetate keeps the look light.","Square · clear acetate","Blush crystal, smoke, or clear","Transparent"),
+        ]
+    if "square" in key:
+        return [
+            ("Soft Oval","Rounded edges soften a defined jaw with an easy curved line.","Oval · fine rounded rim","Blush, champagne, or honey","Oval"),
+            ("Classic Aviator","Curved lenses offset angular lines and bring a balanced, relaxed silhouette.","Aviator · double bridge","Gold, bronze, or soft silver","Aviator"),
+            ("Rounded Cat-Eye","A soft upsweep adds definition without repeating the jaw's straight edges.","Cat-eye · light acetate","Rose crystal, tortoise, or plum","Cat-eye"),
+        ]
+    if "oblong" in key or "long" in key:
+        return [
+            ("Tall Aviator","A deeper lens adds visual width and balances a longer face proportion.","Aviator · deep teardrop lens","Gold, bronze, or tortoise","Aviator"),
+            ("Wide Oval","A broad oval frame creates a soft horizontal line across the face.","Oval · wide lens fit","Champagne, olive, or clear","Oval"),
+            ("Statement Square","A taller square lens adds presence and keeps the frame in proportion.","Square · substantial lens","Tortoise, burgundy, or black","Square"),
+        ]
+    if "heart" in key or "diamond" in key:
+        return [
+            ("Subtle Cat-Eye","A fine upswept rim follows the cheekbones without adding a heavy line at the brow.","Cat-eye · fine lower profile","Rose gold, clear, or soft plum","Cat-eye"),
+            ("Oval Wire Frame","A narrow rounded shape keeps the upper face feeling open.","Oval · lightweight profile","Champagne, silver, or pale gold","Oval"),
+            ("Lightweight Aviator","A curved lens and delicate bridge complement defined cheekbones without a heavy upper rim.","Aviator · slender double bridge","Gold with tea, smoke, or clear lenses","Aviator"),
+        ]
+    return [
+        ("Modern Cat-Eye","A gentle outer lift emphasizes the cheekbones and adds a graceful diagonal.","Cat-eye · medium acetate rim","Tortoise, berry, or rose crystal","Cat-eye"),
+        ("Soft Rectangle","A clean horizontal line frames the eyes; eased corners keep the look approachable.","Rectangle · rounded corners","Honey, espresso, or blush crystal","Rectangle"),
+        ("Classic Round","A rounded frame adds relaxed contrast to balanced proportions.","Round · slim full rim","Gold, clear, or dark tortoise","Round"),
+    ]
+
+
+_EYEWEAR_PRODUCT_IMAGE_FILES={
+    "Cat-eye":"cat_eye.jpg",
+    "Rectangle":"rectangle.jpg",
+    "Round":"round.jpg",
+    "Oval":"oval.jpg",
+    "Aviator":"aviator.webp",
+    "Square":"square.jpg",
+    "Transparent":"square.jpg",
+}
+
+
+def _reference_photo(asset_name):
+    """Load a local photographic style reference for the hairstyle studio."""
+    path=_local_img_path(asset_name)
+    image=ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    image.thumbnail((900,900),Image.Resampling.LANCZOS)
+    return image
+
+
+def _eyewear_product_image(frame_style):
+    """Load an isolated, local product photo without a model or face overlay."""
+    filename=_EYEWEAR_PRODUCT_IMAGE_FILES.get(frame_style)
+    try:
+        if not filename:
+            raise FileNotFoundError(f"No product photo is mapped for {frame_style}.")
+        path=os.path.join(_ASSET_DIR,"eyewear_products",filename)
+        with Image.open(path) as source:
+            image=ImageOps.exif_transpose(source).convert("RGB")
+        image.thumbnail((1400,900),Image.Resampling.LANCZOS)
+        return image
+    except (OSError,ValueError,TypeError,FileNotFoundError):
+        image=Image.new("RGB",(1200,680),(249,242,242))
+        draw=ImageDraw.Draw(image)
+        draw.rounded_rectangle((24,24,1176,656),radius=28,fill=(255,255,255),outline=(224,197,201),width=3)
+        draw.text((600,320),f"{frame_style} product photo unavailable",fill=(136,74,82),anchor="mm")
+        return image
+
+
+_EYEWEAR_FRAME_INFO={
+    "Cat-eye":(
+        "A medium-width acetate frame with softly lifted outer corners and a graceful upswept silhouette.",
+        "Let the lifted corners be the focal point; pair with simple earrings and softly defined brows.",
+    ),
+    "Rectangle":(
+        "A softly rounded rectangular silhouette with a clean horizontal line and an easy everyday fit.",
+        "Try relaxed textures or rounded accessories to balance the frame's neat, horizontal lines.",
+    ),
+    "Round":(
+        "A classic rounded frame with a slim full rim, balanced bridge, and lightweight profile.",
+        "Pair the curved lenses with tailored lines or angular accessories for a little contrast.",
+    ),
+    "Oval":(
+        "A softly elongated oval profile with a lightweight rim and gentle, versatile curves.",
+        "Keep the look airy with delicate jewelry and soft, clean lines around the neckline.",
+    ),
+    "Aviator":(
+        "A deep curved lens with a refined double bridge and slender metal lines.",
+        "Wear with simple shapes and let the double bridge add a subtle architectural detail.",
+    ),
+    "Square":(
+        "A structured square frame with gently softened corners and a modern full-rim profile.",
+        "Balance the defined corners with soft fabrics or rounded jewelry for an easy finish.",
+    ),
+    "Transparent":(
+        "A defined square silhouette in clear acetate that gives structure while keeping the look light.",
+        "Use the clear frame as a quiet base for a colorful lip, earrings, or a textured outfit.",
+    ),
+}
+
+
+def _reset_style_studio(prefix):
+    st.session_state[f"{prefix}_image"] = None
+    st.session_state[f"{prefix}_source"] = ""
+    st.session_state[f"{prefix}_selected_name"] = ""
+    st.session_state[f"{prefix}_upload_key"] += 1
+    if prefix == "hair":
+        st.session_state.hair_try_style = ""
+        st.session_state.hair_selected_style = ""
+        st.session_state.hair_selected_name = ""
+        st.session_state.hair_comparison = "Side-by-side"
+    else:
+        st.session_state.eyewear_selected_name = ""
+
+
 def analyze_portrait_landmarks(pil_image):
     """Executes facial landmark detection, mathematical geometry, and CIELAB skin color analysis.
     Preserves 100% of existing geometry and optical analysis logic.
@@ -1530,141 +1890,267 @@ elif "Virtual Try-On & Makeup" in st.session_state.active_studio_name:
     st.markdown(
         f"""
         <div class="stitch-hero">
-            <span class="stitch-pill stitch-pill-secondary">TAILORED COSMETIC ARCHITECTURE</span>
-            <h1 style="font-size: 32px; margin: 6px 0 8px 0;">Bespoke Makeup Placement for {shape}</h1>
-            <p style="color: var(--color-on-surface-variant); font-size: 14.5px; margin: 0;">
-                Calculated cosmetic application points to complement your unique facial proportions.
+            <span class="stitch-pill stitch-pill-secondary">VIRTUAL COSMETIC ATELIER</span>
+            <h1 style="font-size:32px;margin:6px 0 8px 0;">Virtual Makeup Try-On</h1>
+            <p style="color:var(--color-on-surface-variant);font-size:14.5px;margin:0;">
+                Upload a front-facing portrait and preview feature-aligned color with local FaceMesh processing. Your image stays in this session.
             </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    if shape == "Oblong / Long":
-        makeup_rules = [
-            ("Horizontal Blush Balance", "Apply blush horizontally across the apples of cheeks to create an illusion of wider harmony."),
-            ("Perimeter Shading Contour", "Sweep contour gently along the hairline and base of chin to visually soften vertical length."),
-            ("Central Focus Lips", "Opt for defined satin or glossy lip finishes to draw focus toward the facial center."),
-        ]
-    elif shape == "Round / Square":
-        makeup_rules = [
-            ("Sculpted Diagonal Blush", "Apply blush in an upward diagonal sweep toward the temples for a defined silhouette."),
-            ("Jawline & Hollow Definition", "Shade gently along cheek hollows and jawline angles to add soft structural depth."),
-            ("Elongating Light Centers", "Highlight the bridge of the nose and center of the forehead to draw eye movement vertically."),
-        ]
+    uploaded_makeup_file = st.file_uploader(
+        "Upload a front-facing portrait",
+        type=["jpg", "jpeg", "png"],
+        key=f"virtual_makeup_file_{st.session_state.virtual_makeup_upload_key}",
+        help="Use a clear, well-lit photo with the full face visible.",
+    )
+    if uploaded_makeup_file is not None:
+        try:
+            uploaded_makeup_file.seek(0)
+            makeup_image = ImageOps.exif_transpose(Image.open(uploaded_makeup_file)).convert("RGB")
+            makeup_image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+            st.session_state.virtual_makeup_image = makeup_image.copy()
+            st.session_state.virtual_makeup_source = uploaded_makeup_file.name
+        except Exception:
+            st.session_state.virtual_makeup_image = None
+            st.error("This image could not be opened. Please upload a valid JPG or PNG portrait.")
+
+    makeup_image = st.session_state.virtual_makeup_image
+    if makeup_image is None:
+        st.info("Upload a front-facing portrait to start a real makeup preview.")
     else:
-        makeup_rules = [
-            ("Harmonious Versatile Placement", "Balanced proportions support versatile blush placement on apples or temples."),
-            ("Radiant Symmetry Glow", "Emphasize natural symmetry with radiant champagne highlighter across the high cheekbones."),
-            ("Singular Focal Point", "Feature either bold eyes or statement lips as the hero focus for a clean editorial look."),
-        ]
+        lipstick_shades = {
+            "Rosewood Nude": "#A94F68",
+            "Petal Pink": "#C86B7D",
+            "Classic Red": "#A72D3D",
+            "Berry Wine": "#74364F",
+            "Coral Bloom": "#D66B59",
+        }
+        blush_shades = {
+            "Peach Bloom": "#E98979",
+            "Petal Pink": "#D96F88",
+            "Rose Mauve": "#B86479",
+            "Warm Terracotta": "#C86D52",
+        }
+        eyeshadow_shades = {
+            "Soft Rose": "#B97482",
+            "Champagne": "#C99C72",
+            "Warm Taupe": "#80665E",
+            "Plum Smoke": "#69475E",
+            "Bronze Glow": "#A66B3D",
+        }
+        controls_a, controls_b, controls_c = st.columns(3, gap="medium")
+        with controls_a:
+            lipstick_name = st.selectbox("Lipstick shade", list(lipstick_shades), key="makeup_lipstick")
+            blush_name = st.selectbox("Blush shade", list(blush_shades), key="makeup_blush")
+        with controls_b:
+            blush_placement = st.selectbox(
+                "Blush placement",
+                ["Soft apples", "Lifted sweep", "Soft drape"],
+                key="makeup_blush_placement",
+            )
+            eyeshadow_name = st.selectbox("Eyeshadow shade", list(eyeshadow_shades), key="makeup_eyeshadow")
+        with controls_c:
+            eyeliner_style = st.selectbox(
+                "Eyeliner style",
+                ["None", "Soft definition", "Classic wing"],
+                key="makeup_eyeliner",
+            )
+            intensity = st.slider("Makeup intensity", 0, 100, value=65, key="makeup_intensity", format="%d%%")
+
+        normalized_buffer = BytesIO()
+        makeup_image.save(normalized_buffer, format="PNG", optimize=True)
+        normalized_bytes = normalized_buffer.getvalue()
+        try:
+            with st.spinner("Mapping eyes, lips, and cheeks…"):
+                makeup_points = _cached_makeup_face_points(normalized_bytes)
+            if makeup_points is None:
+                st.warning("No face was detected. Try a clear, front-facing portrait with even lighting.")
+                _show_image_inline(makeup_image, f"Original portrait · {st.session_state.virtual_makeup_source}")
+            else:
+                makeup_preview = _virtual_makeup_preview(
+                    makeup_image,
+                    makeup_points,
+                    lipstick_shades[lipstick_name],
+                    blush_shades[blush_name],
+                    blush_placement,
+                    eyeshadow_shades[eyeshadow_name],
+                    eyeliner_style,
+                    intensity,
+                )
+                comparison = st.radio(
+                    "Preview comparison",
+                    ["Side-by-side", "Makeup preview", "Original photo"],
+                    horizontal=True,
+                    key="makeup_comparison",
+                )
+                if comparison == "Side-by-side":
+                    before_col, after_col = st.columns(2, gap="medium")
+                    with before_col:
+                        _show_image_inline(makeup_image, f"Original · {st.session_state.virtual_makeup_source}")
+                    with after_col:
+                        _show_image_inline(makeup_preview, "Virtual makeup preview")
+                elif comparison == "Makeup preview":
+                    _show_image_inline(makeup_preview, "Virtual makeup preview")
+                else:
+                    _show_image_inline(makeup_image, f"Original · {st.session_state.virtual_makeup_source}")
+
+                _save_col, _reset_col = st.columns(2, gap="medium")
+                with _save_col:
+                    if st.button("💖 Save Makeup Look", type="primary", use_container_width=True, key="btn_save_virtual_makeup"):
+                        detail = (
+                            f"Face shape: {shape}. Lipstick: {lipstick_name}; blush: {blush_name} ({blush_placement}); "
+                            f"eyeshadow: {eyeshadow_name}; eyeliner: {eyeliner_style}; intensity: {intensity}%."
+                        )
+                        add_to_favorites("Virtual Makeup Look", f"{lipstick_name} Atelier Look", detail)
+                with _reset_col:
+                    st.button(
+                        "↺ Reset Try-On",
+                        use_container_width=True,
+                        key="btn_reset_virtual_makeup",
+                        on_click=_reset_virtual_makeup,
+                    )
+        except Exception as exc:
+            st.error(f"The makeup preview could not be rendered: {exc}")
+
+    st.markdown("### Bespoke placement notes")
+    makeup_rules = [
+        ("Blush placement", f"The preview uses a {st.session_state.get('makeup_blush_placement', 'lifted sweep').lower()} placement, adjusted to the detected cheek landmarks."),
+        ("Color balance", "Try warm peach, rose, or berry shades and compare each directly on your portrait."),
+        ("Facial architecture", f"Your current face-shape guide is {shape}; these notes are styling suggestions, not fixed rules."),
+    ]
     m_cols = st.columns(3)
     for idx, (title, tip) in enumerate(makeup_rules):
         with m_cols[idx]:
             st.markdown(
                 f"""
-                <div class="stitch-card" style="min-height: 160px;">
-                    <span style="color: var(--color-primary); font-weight: 700; font-size: 11px; text-transform: uppercase;">0{idx+1} · {title}</span>
-                    <p style="margin: 8px 0 12px 0; font-size: 13.5px; color: #201a1c; line-height: 1.45;">{tip}</p>
+                <div class="stitch-card" style="min-height:130px;">
+                    <span style="color:var(--color-primary);font-weight:700;font-size:11px;text-transform:uppercase;">0{idx+1} · {title}</span>
+                    <p style="margin:8px 0 12px 0;font-size:13.5px;color:#201a1c;line-height:1.45;">{tip}</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-            if st.button(f"💖 Save Makeup 0{idx+1}", key=f"btn_makeup_{idx}", use_container_width=True):
-                add_to_favorites("Makeup Technique", title, tip)
 
 elif "Hairstyle & Cuts" in st.session_state.active_studio_name:
-    shape = st.session_state.geometry.get("face_shape", "Oval / Balanced")
-    st.markdown(
-        f"""
-        <div class="stitch-hero">
-            <span class="stitch-pill stitch-pill-secondary">HAIR ARCHITECTURE & SILHOUETTE</span>
-            <h1 style="font-size: 32px; margin: 6px 0 8px 0;">Hairstyles & Cuts for {shape}</h1>
-            <p style="color: var(--color-on-surface-variant); font-size: 14.5px; margin: 0;">
-                Volume placement, partings, and face-framing cuts tailored to your structural geometry.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if shape == "Oblong / Long":
-        hair_rules = [
-            ("Lateral Volume & Waves", "Voluminous blowout waves or side parts introduce horizontal balance."),
-            ("Curtain Bangs & Soft Layers", "Curtain or eyelash-skimming bangs break vertical visual length elegantly."),
-            ("Low Nape Chignons", "Soft low buns keep focus balanced; avoid extremely high, skyward ponytails."),
-        ]
-    elif shape == "Round / Square":
-        hair_rules = [
-            ("Face-Framing Cascades", "Long layers falling past the chin softly elongate rounded cheek curves."),
-            ("Crown Volume Lift", "Subtle height at the crown elongates the silhouette vertically."),
-            ("Fluid Sleek Waves", "Sleek straight lines or gentle cascading waves slim side contours."),
-        ]
+    st.markdown("""<div class="stitch-hero"><span class="stitch-pill stitch-pill-secondary">HAIR ARCHITECTURE & SILHOUETTE</span><h1 style="font-size:32px;margin:6px 0 8px;">Hairstyle Atelier</h1><p style="color:var(--color-on-surface-variant);font-size:14.5px;margin:0;">Face-shape-led hairstyle ideas with photographic references selected from the Glow AI portrait collection.</p></div>""",unsafe_allow_html=True)
+    upload=st.file_uploader("Upload a front-facing portrait",type=["jpg","jpeg","png"],key=f"hair_file_{st.session_state.hair_upload_key}")
+    if upload is not None:
+        try:
+            upload.seek(0); portrait=ImageOps.exif_transpose(Image.open(upload)).convert("RGB"); portrait.thumbnail((1000,1000),Image.Resampling.LANCZOS)
+            st.session_state.hair_image=portrait.copy(); st.session_state.hair_source=upload.name
+        except Exception:
+            st.session_state.hair_image=None; st.error("This image could not be opened. Choose a valid JPG or PNG portrait.")
+    if st.session_state.hair_image is None and st.session_state.original_image is not None:
+        if st.button("Use the portrait already analyzed in Face & Color Analysis",key="use_existing_hair_portrait"):
+            st.session_state.hair_image=st.session_state.original_image.copy(); st.session_state.hair_source="Face & Color Analysis portrait"
+    portrait=st.session_state.hair_image
+    if portrait is None:
+        st.info("Upload a clear, front-facing portrait to receive three hairstyle recommendations.")
     else:
-        hair_rules = [
-            ("Balanced Versatility", "Harmonious proportions support center parts, side sweeps, and bobs alike."),
-            ("Effortless Half-Up Styles", "Soft half-up waves or chic French twists highlight natural cheekbones."),
-            ("Cheekbone Tendrils", "Light tendrils framing the temple emphasize balanced bone structure."),
-        ]
-    h_cols = st.columns(3)
-    for idx, (title, tip) in enumerate(hair_rules):
-        with h_cols[idx]:
-            st.markdown(
-                f"""
-                <div class="stitch-card" style="min-height: 160px;">
-                    <span style="color: var(--color-primary); font-weight: 700; font-size: 11px; text-transform: uppercase;">0{idx+1} · {title}</span>
-                    <p style="margin: 8px 0 12px 0; font-size: 13.5px; color: #201a1c; line-height: 1.45;">{tip}</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if st.button(f"💖 Save Style 0{idx+1}", key=f"btn_hair_{idx}", use_container_width=True):
-                add_to_favorites("Hairstyle Suggestion", title, tip)
+        b=BytesIO(); portrait.save(b,format="PNG")
+        try:
+            with st.spinner("Mapping facial proportions…"): points=_cached_style_face_points(b.getvalue())
+        except Exception as exc:
+            points=None; st.error(f"Portrait analysis could not complete: {exc}")
+        if points is None:
+            st.warning("No face was detected. Try a clear, front-facing portrait with both eyes and the full face visible.")
+            _show_image_inline(portrait,f"Uploaded portrait · {st.session_state.hair_source}")
+        else:
+            shape=_estimate_style_face_shape(points); st.session_state.geometry["face_shape"]=shape
+            _show_image_inline(portrait,f"Your portrait · {st.session_state.hair_source}")
+            st.markdown(f"<div class='stitch-card' style='padding:16px 20px;margin:12px 0'><span class='stitch-pill stitch-pill-secondary'>DETECTED FACE SHAPE</span><h3 style='margin:8px 0 4px'>{html.escape(shape)}</h3><p style='margin:0;color:#766b6d'>{html.escape(_face_shape_explanation(shape))}</p></div>",unsafe_allow_html=True)
+            recommendations=_style_recommendations(shape,"hair")
+            st.markdown("### Three hairstyle recommendations")
+            cards=st.columns(3,gap="medium")
+            for i,(name,why,length,description,maintenance,asset_name,code) in enumerate(recommendations):
+                with cards[i]:
+                    _show_image_inline(_reference_photo(asset_name),f"Photo reference · {name}")
+                    st.markdown(f"**0{i+1} · {name}**")
+                    st.caption(why)
+                    st.markdown(f"**Length:** {length}  \n**Style:** {description}  \n**Maintenance:** {maintenance}")
+                    if st.button(f"Explore This Style · {i+1}",key=f"explore_hair_{i}",type="primary",use_container_width=True):
+                        st.session_state.hair_selected_name=name
+                        st.session_state.hair_selected_style=code
+            selected=next((r for r in recommendations if r[0]==st.session_state.hair_selected_name),None)
+            if selected:
+                name,why,length,description,maintenance,asset_name,code=selected
+                st.markdown("### Style details")
+                detail_col,copy_col=st.columns([1,1.2],gap="large")
+                with detail_col:
+                    _show_image_inline(_reference_photo(asset_name),f"Hairstyle reference · {name}")
+                with copy_col:
+                    st.markdown(f"#### {name}")
+                    st.markdown(f"**Why it suits {shape}:** {why}")
+                    st.markdown(f"**Length:** {length}  \n**Description:** {description}  \n**Maintenance:** {maintenance}")
+                    if st.button("💖 Save Hairstyle",key="save_hair_style",type="primary",use_container_width=True):
+                        add_to_favorites("Hairstyle Recommendation",name,f"Recommended for {shape}. Length: {length}. {description} Maintenance: {maintenance}. {why}")
 
 elif "Eyewear Studio" in st.session_state.active_studio_name:
-    shape = st.session_state.geometry.get("face_shape", "Oval / Balanced")
-    st.markdown(
-        f"""
-        <div class="stitch-hero">
-            <span class="stitch-pill stitch-pill-secondary">OPTICAL & SUNGLASS SILHOUETTES</span>
-            <h1 style="font-size: 32px; margin: 6px 0 8px 0;">Frame Silhouettes for {shape}</h1>
-            <p style="color: var(--color-on-surface-variant); font-size: 14.5px; margin: 0;">
-                Curated eyewear geometries that balance your length-to-width ratio.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if shape == "Oblong / Long":
-        eyewear_rules = [
-            ("Taller Frames & Aviators", "Taller lens heights and aviator silhouettes add pleasing horizontal balance."),
-            ("Decorative Contrast Temples", "Contrasting or accented temple arms draw the eye outward across the face."),
-            ("Silhouette Guidance", "Avoid extremely narrow or micro-wire frames that emphasize vertical length."),
-        ]
-    elif shape == "Round / Square":
-        eyewear_rules = [
-            ("Angular & Cat-Eye Frames", "Crisp rectangular or uplifted cat-eye shapes add contrast to soft curves."),
-            ("Wide Cheekbone Fit", "Slightly wider bridges sharpen contours and elevate the cheekbone plane."),
-            ("Silhouette Guidance", "Avoid small circular lenses that mirror circular proportions."),
-        ]
+    st.markdown("""<div class="stitch-hero"><span class="stitch-pill stitch-pill-secondary">OPTICAL & SUNGLASS ATELIER</span><h1 style="font-size:32px;margin:6px 0 8px;">Eyewear Studio</h1><p style="color:var(--color-on-surface-variant);font-size:14.5px;margin:0;">Personalized frame recommendations selected for your face shape, shown with frame-only product photos.</p></div>""",unsafe_allow_html=True)
+    upload=st.file_uploader("Upload a front-facing portrait",type=["jpg","jpeg","png"],key=f"eyewear_file_{st.session_state.eyewear_upload_key}")
+    if upload is not None:
+        try:
+            upload.seek(0); portrait=ImageOps.exif_transpose(Image.open(upload)).convert("RGB"); portrait.thumbnail((1000,1000),Image.Resampling.LANCZOS)
+            st.session_state.eyewear_image=portrait.copy(); st.session_state.eyewear_source=upload.name
+        except Exception:
+            st.session_state.eyewear_image=None; st.error("This image could not be opened. Choose a valid JPG or PNG portrait.")
+    if st.session_state.eyewear_image is None and st.session_state.original_image is not None:
+        if st.button("Use the portrait already analyzed in Face & Color Analysis",key="use_existing_eyewear_portrait"):
+            st.session_state.eyewear_image=st.session_state.original_image.copy(); st.session_state.eyewear_source="Face & Color Analysis portrait"
+    portrait=st.session_state.eyewear_image
+    if portrait is None:
+        st.info("Upload a clear, front-facing portrait to receive personalized frame recommendations.")
     else:
-        eyewear_rules = [
-            ("Geometric or Rounded Freedom", "Versatile proportions flatter square, geometric, and curved frames alike."),
-            ("Warm Amber & Translucent Tones", "Experiment with champagne, rose acetate, or classic tortoiseshell."),
-            ("Cheekbone Width Match", "Choose frame widths that align with the widest point of your cheekbones."),
-        ]
-    g_cols = st.columns(3)
-    for idx, (title, tip) in enumerate(eyewear_rules):
-        with g_cols[idx]:
-            st.markdown(
-                f"""
-                <div class="stitch-card" style="min-height: 160px;">
-                    <span style="color: var(--color-primary); font-weight: 700; font-size: 11px; text-transform: uppercase;">0{idx+1} · {title}</span>
-                    <p style="margin: 8px 0 12px 0; font-size: 13.5px; color: #201a1c; line-height: 1.45;">{tip}</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if st.button(f"💖 Save Frame 0{idx+1}", key=f"btn_glass_{idx}", use_container_width=True):
-                add_to_favorites("Eyewear Silhouette", title, tip)
+        b=BytesIO(); portrait.save(b,format="PNG")
+        try:
+            with st.spinner("Mapping eye corners and nose bridge…"): points=_cached_style_face_points(b.getvalue())
+        except Exception as exc:
+            points=None; st.error(f"Portrait analysis could not complete: {exc}")
+        if points is None:
+            st.warning("No face was detected. Try a clear, front-facing portrait with both eyes visible.")
+            _show_image_inline(portrait,f"Uploaded portrait · {st.session_state.eyewear_source}")
+        else:
+            shape=_estimate_style_face_shape(points); st.session_state.geometry["face_shape"]=shape
+            st.markdown(f"<div class='stitch-card' style='padding:16px 20px;margin:12px 0'><span class='stitch-pill stitch-pill-secondary'>DETECTED FACE SHAPE</span><h3 style='margin:8px 0 4px'>{html.escape(shape)}</h3><p style='margin:0;color:#766b6d'>{html.escape(_face_shape_explanation(shape))}</p></div>",unsafe_allow_html=True)
+            recommendations=_style_recommendations(shape,"eyewear")
+            st.markdown("### Three personalized frame recommendations")
+            cards=st.columns(3,gap="medium")
+            for i,(name,why,design,palette,frame) in enumerate(recommendations):
+                with cards[i]:
+                    _show_image_inline(_eyewear_product_image(frame),f"Eyeglasses product photo · {name}")
+                    st.markdown(f"**0{i+1} · {name}**"); st.caption(why)
+                    st.markdown(f"**Frame shape:** {design}  \n**Colour suggestions:** {palette}")
+                    if st.button(f"Explore This Frame · {i+1}",key=f"explore_eyewear_{i}",type="primary",use_container_width=True):
+                        st.session_state.eyewear_selected_name=name
+            selected_frame=next((item for item in recommendations if item[0]==st.session_state.eyewear_selected_name),None)
+            if selected_frame:
+                name,why,design,palette,frame=selected_frame
+                about,styling_tip=_EYEWEAR_FRAME_INFO.get(frame,(
+                    f"A thoughtfully proportioned {design.lower()} selected for your estimated face shape.",
+                    "Keep the frame comfortable and balanced with your brow line and everyday accessories.",
+                ))
+                st.markdown("### Frame details")
+                with st.container(border=True):
+                    st.markdown(
+                        f"<div class='stitch-card' style='padding:18px 20px;margin:0 0 12px'>"
+                        f"<span class='stitch-pill stitch-pill-secondary'>PERSONALIZED FRAME PROFILE</span>"
+                        f"<h3 style='margin:10px 0 8px'>{html.escape(name)}</h3>"
+                        f"<p style='margin:0 0 12px;color:#766b6d'><strong>Why it may suit {html.escape(shape)}:</strong> {html.escape(why)}</p>"
+                        f"<p style='margin:0 0 12px;color:#766b6d'><strong>About this frame:</strong> {html.escape(about)}</p>"
+                        f"<p style='margin:0 0 12px;color:#766b6d'><strong>Frame shape:</strong> {html.escape(design)}</p>"
+                        f"<p style='margin:0 0 12px;color:#766b6d'><strong>Colour suggestions:</strong> {html.escape(palette)}</p>"
+                        f"<p style='margin:0;color:#766b6d'><strong>Styling tips:</strong> {html.escape(styling_tip)}</p>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("💖 Save Frame",key="save_eyewear_frame",type="primary",use_container_width=True):
+                        add_to_favorites(
+                            "Eyewear Frame",
+                            name,
+                            f"Recommended for {shape}. Why: {why} About: {about} Frame shape: {design}. Suggested colours: {palette}. Styling tip: {styling_tip}.",
+                        )
 
 elif "Skincare & Product Advisor" in st.session_state.active_studio_name:
     st.markdown(
