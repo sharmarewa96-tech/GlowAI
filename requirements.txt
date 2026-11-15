@@ -4,5 +4,4 @@ numpy<2.0.0
 plotly>=5.18.0
 Pillow>=10.0.0
 python-dotenv>=1.0.0
-libgl1
-libglib2.0-0
+opencv-contrib-python==4.11.0.86
