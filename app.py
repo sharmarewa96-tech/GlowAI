@@ -2014,25 +2014,6 @@ elif "Virtual Try-On & Makeup" in st.session_state.active_studio_name:
         except Exception as exc:
             st.error(f"The makeup preview could not be rendered: {exc}")
 
-    st.markdown("### Bespoke placement notes")
-    makeup_rules = [
-        ("Blush placement", f"The preview uses a {st.session_state.get('makeup_blush_placement', 'lifted sweep').lower()} placement, adjusted to the detected cheek landmarks."),
-        ("Color balance", "Try warm peach, rose, or berry shades and compare each directly on your portrait."),
-        ("Facial architecture", f"Your current face-shape guide is {shape}; these notes are styling suggestions, not fixed rules."),
-    ]
-    m_cols = st.columns(3)
-    for idx, (title, tip) in enumerate(makeup_rules):
-        with m_cols[idx]:
-            st.markdown(
-                f"""
-                <div class="stitch-card" style="min-height:130px;">
-                    <span style="color:var(--color-primary);font-weight:700;font-size:11px;text-transform:uppercase;">0{idx+1} · {title}</span>
-                    <p style="margin:8px 0 12px 0;font-size:13.5px;color:#201a1c;line-height:1.45;">{tip}</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
 elif "Hairstyle & Cuts" in st.session_state.active_studio_name:
     st.markdown("""<div class="stitch-hero"><span class="stitch-pill stitch-pill-secondary">HAIR ARCHITECTURE & SILHOUETTE</span><h1 style="font-size:32px;margin:6px 0 8px;">Hairstyle Atelier</h1><p style="color:var(--color-on-surface-variant);font-size:14.5px;margin:0;">Face-shape-led hairstyle ideas with photographic references selected from the Glow AI portrait collection.</p></div>""",unsafe_allow_html=True)
     upload=st.file_uploader("Upload a front-facing portrait",type=["jpg","jpeg","png"],key=f"hair_file_{st.session_state.hair_upload_key}")
