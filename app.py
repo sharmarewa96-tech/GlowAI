@@ -15,15 +15,18 @@ import streamlit as st
 # ------------------------------------------------------------------------------
 _ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
+@st.cache_data(show_spinner=False, max_entries=64)
 def _local_img_b64(filename: str) -> str:
     """Return a validated local image data URI, or an embedded SVG placeholder."""
     path = os.path.join(_ASSET_DIR, filename)
     try:
-        with Image.open(path) as image:
-            image.verify()
         with open(path, "rb") as fh:
-            encoded = base64.b64encode(fh.read()).decode("ascii")
-        mime = Image.MIME.get(Image.open(path).format, "image/png")
+            image_bytes = fh.read()
+        with Image.open(BytesIO(image_bytes)) as image:
+            image_format = image.format
+            image.verify()
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        mime = Image.MIME.get(image_format, "image/png")
         return f"data:{mime};base64,{encoded}"
     except (OSError, ValueError, TypeError):
         # Inline SVG keeps HTML cards visible even if a local asset is missing.
@@ -138,6 +141,8 @@ for _prefix in ("hair", "eyewear"):
     st.session_state.setdefault(f"{_prefix}_upload_key", 0)
     st.session_state.setdefault(f"{_prefix}_image", None)
     st.session_state.setdefault(f"{_prefix}_source", "")
+    st.session_state.setdefault(f"{_prefix}_upload_digest", None)
+    st.session_state.setdefault(f"{_prefix}_image_bytes", None)
     if _prefix == "hair":
         st.session_state.setdefault("hair_try_style", "")
 for _key, _value in {
@@ -151,6 +156,10 @@ if "virtual_makeup_image" not in st.session_state:
     st.session_state.virtual_makeup_image = None
 if "virtual_makeup_source" not in st.session_state:
     st.session_state.virtual_makeup_source = ""
+st.session_state.setdefault("virtual_makeup_upload_digest", None)
+st.session_state.setdefault("virtual_makeup_image_bytes", None)
+st.session_state.setdefault("virtual_makeup_preview_key", None)
+st.session_state.setdefault("virtual_makeup_preview_image", None)
 for _makeup_key, _makeup_default in {
     "makeup_lipstick": "Rosewood Nude",
     "makeup_blush": "Peach Bloom",
@@ -181,6 +190,7 @@ def reset_all_visage_state():
     st.session_state.staged_image = None
     st.session_state.staged_image_source = None
     st.session_state.last_uploaded_name = None
+    st.session_state.last_uploaded_digest = None
     st.session_state.last_camera_capture_digest = None
     st.session_state.camera_analysis_attempted = False
     st.session_state.original_image = None
@@ -833,43 +843,10 @@ _IMG_STEP_3 = _local_img_b64("barrier_cream.jpg")
 # 4. COMPUTER VISION & CORE PYTHON LOGIC (100% PRESERVED)
 # ==============================================================================
 def generate_sample_portrait():
-    """Generates an elegant synthetic portrait that MediaPipe reliably detects for instant demo testing."""
-    img = Image.new("RGB", (480, 580), color=(253, 248, 244))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse([110, 60, 370, 480], fill=(62, 40, 32))
-    draw.ellipse(
-        [135, 110, 345, 470],
-        fill=(240, 204, 185),
-        outline=(218, 175, 155),
-        width=2,
-    )
-    draw.chord([125, 75, 355, 330], 190, 350, fill=(72, 48, 38))
-    draw.arc([165, 215, 225, 235], 195, 345, fill=(65, 42, 33), width=3)
-    draw.arc([255, 215, 315, 235], 195, 345, fill=(65, 42, 33), width=3)
-    draw.ellipse(
-        [170, 235, 220, 262],
-        fill=(255, 255, 255),
-        outline=(85, 55, 45),
-        width=1,
-    )
-    draw.ellipse([186, 240, 204, 258], fill=(68, 45, 34))
-    draw.ellipse([192, 244, 198, 250], fill=(255, 255, 255))
-    draw.ellipse(
-        [260, 235, 310, 262],
-        fill=(255, 255, 255),
-        outline=(85, 55, 45),
-        width=1,
-    )
-    draw.ellipse([276, 240, 294, 258], fill=(68, 45, 34))
-    draw.ellipse([282, 244, 288, 250], fill=(255, 255, 255))
-    draw.line(
-        [(240, 260), (236, 312), (244, 312)], fill=(208, 160, 140), width=2
-    )
-    draw.ellipse([155, 290, 205, 330], fill=(245, 188, 182))
-    draw.ellipse([275, 290, 325, 330], fill=(245, 188, 182))
-    draw.chord([195, 352, 285, 396], 0, 180, fill=(210, 105, 122))
-    draw.chord([195, 362, 285, 385], 180, 360, fill=(195, 90, 108))
-    return img
+    """Loads the user-provided real portrait used by the studio sample workflow."""
+    sample_path = os.path.join(_ASSET_DIR, "studio_sample_visage.png")
+    with Image.open(sample_path) as image:
+        return ImageOps.exif_transpose(image).convert("RGB")
 
 @st.cache_data(show_spinner=False, max_entries=4)
 def _cached_makeup_face_points(image_bytes: bytes):
@@ -1011,6 +988,10 @@ def _virtual_makeup_preview(image, points, lipstick, blush, blush_placement, eye
 def _reset_virtual_makeup():
     st.session_state.virtual_makeup_image = None
     st.session_state.virtual_makeup_source = ""
+    st.session_state.virtual_makeup_upload_digest = None
+    st.session_state.virtual_makeup_image_bytes = None
+    st.session_state.virtual_makeup_preview_key = None
+    st.session_state.virtual_makeup_preview_image = None
     st.session_state.virtual_makeup_upload_key += 1
     st.session_state.makeup_lipstick = "Rosewood Nude"
     st.session_state.makeup_blush = "Peach Bloom"
@@ -1130,6 +1111,7 @@ _EYEWEAR_PRODUCT_IMAGE_FILES={
 }
 
 
+@st.cache_data(show_spinner=False, max_entries=32)
 def _reference_photo(asset_name):
     """Load a local photographic style reference for the hairstyle studio."""
     path=_local_img_path(asset_name)
@@ -1138,6 +1120,7 @@ def _reference_photo(asset_name):
     return image
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
 def _eyewear_product_image(frame_style):
     """Load an isolated, local product photo without a model or face overlay."""
     filename=_EYEWEAR_PRODUCT_IMAGE_FILES.get(frame_style)
@@ -1612,16 +1595,15 @@ if "Overview / Studio" in st.session_state.active_studio_name:
                 help="Upload a clear, front-facing portrait to preview immediately.",
             )
             if uploaded_file is not None:
-                if (
-                    st.session_state.staged_image is None
-                    or st.session_state.last_uploaded_name != uploaded_file.name
-                ):
+                upload_bytes = uploaded_file.getvalue()
+                upload_digest = hashlib.sha256(upload_bytes).hexdigest()
+                if upload_digest != st.session_state.get("last_uploaded_digest"):
                     try:
-                        uploaded_file.seek(0)
-                        img_loaded = ImageOps.exif_transpose(Image.open(uploaded_file)).convert("RGB")
+                        img_loaded = ImageOps.exif_transpose(Image.open(BytesIO(upload_bytes))).convert("RGB")
                         img_loaded.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
                         st.session_state.staged_image = img_loaded.copy()
                         st.session_state.last_uploaded_name = uploaded_file.name
+                        st.session_state.last_uploaded_digest = upload_digest
                         st.session_state.staged_image_source = f"Uploaded Photo: {uploaded_file.name}"
                         st.rerun()
                     except Exception as exc:
@@ -1652,7 +1634,7 @@ if "Overview / Studio" in st.session_state.active_studio_name:
             st.markdown(
                 """
                 <div style="padding: 4px 0 12px 0; font-size: 13.5px; color: var(--color-on-surface-variant);">
-                    Load our synthetic studio portrait to test the landmark detection and color engine without uploading a personal photo:
+                    Load the provided front-facing sample portrait to test the landmark detection and color engine:
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -1726,46 +1708,6 @@ if "Overview / Studio" in st.session_state.active_studio_name:
                 if st.button("🗑️ Remove Photo / Choose Another", use_container_width=True, key="btn_remove_staged_photo"):
                     reset_all_visage_state()
                     st.rerun()
-        else:
-            st.markdown(
-                """
-                <div style="margin: 22px 0 10px 0;">
-                    <span class="stitch-pill stitch-pill-active">✦ PORTRAIT INSPECTION & PREVIEW</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            prev_col1, prev_col2 = st.columns([1, 1.3], gap="large")
-            with prev_col1:
-                st.markdown(
-                    """
-                    <figure style="margin:0;width:100%;padding:12px;border:1px solid #d7c1c3;border-radius:20px;background:#fff;box-shadow:0 8px 24px rgba(136,74,82,0.08);box-sizing:border-box;">
-                        <div style="width:100%;aspect-ratio:4/5;min-height:300px;max-height:640px;display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:12px;background:linear-gradient(155deg,#fff9fa 0%,#f8e9ec 100%);">
-                            <svg viewBox="0 0 280 350" role="img" aria-label="Minimal front-facing face outline placeholder" style="width:78%;height:78%;max-width:290px;max-height:360px;">
-                                <path d="M140 38 C91 38 60 75 60 132 C60 198 91 249 140 267 C189 249 220 198 220 132 C220 75 189 38 140 38Z" fill="rgba(255,255,255,0.34)" stroke="#c47c85" stroke-width="3" stroke-linecap="round"/>
-                                <path d="M60 125 C48 115 45 135 53 153 M220 125 C232 115 235 135 227 153" fill="none" stroke="#d7a3aa" stroke-width="3" stroke-linecap="round"/>
-                                <path d="M106 132 Q121 124 132 132 M148 132 Q159 124 174 132 M140 135 C136 158 132 171 140 175 M123 199 Q140 207 157 199" fill="none" stroke="#d7a3aa" stroke-width="2.5" stroke-linecap="round"/>
-                                <path d="M112 267 L108 292 Q140 309 172 292 L168 267 M108 292 Q81 301 68 323 M172 292 Q199 301 212 323" fill="none" stroke="#c47c85" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-                                <path d="M76 322 Q140 302 204 322" fill="none" stroke="#e2bdc2" stroke-width="3" stroke-linecap="round"/>
-                            </svg>
-                        </div>
-                    </figure>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            with prev_col2:
-                st.markdown(
-                    """
-                    <div class="stitch-card" style="min-height:300px;display:flex;flex-direction:column;justify-content:center;">
-                        <span class="stitch-pill stitch-pill-secondary">YOUR PORTRAIT</span>
-                        <h3 style="margin:12px 0 8px 0;font-size:24px;">Your portrait preview will appear here</h3>
-                        <p style="font-size:13.5px;color:var(--color-on-surface-variant);line-height:1.55;margin:0;">
-                            Upload a clear, front-facing portrait with your full face visible and even lighting. You can also capture a live selfie or try the studio sample above.
-                        </p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
     else:
         st.markdown(
             """
@@ -1995,15 +1937,25 @@ elif "Virtual Try-On & Makeup" in st.session_state.active_studio_name:
         help="Use a clear, well-lit photo with the full face visible.",
     )
     if uploaded_makeup_file is not None:
-        try:
-            uploaded_makeup_file.seek(0)
-            makeup_image = ImageOps.exif_transpose(Image.open(uploaded_makeup_file)).convert("RGB")
-            makeup_image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
-            st.session_state.virtual_makeup_image = makeup_image.copy()
-            st.session_state.virtual_makeup_source = uploaded_makeup_file.name
-        except Exception:
-            st.session_state.virtual_makeup_image = None
-            st.error("This image could not be opened. Please upload a valid JPG or PNG portrait.")
+        upload_bytes = uploaded_makeup_file.getvalue()
+        upload_digest = hashlib.sha256(upload_bytes).hexdigest()
+        if upload_digest != st.session_state.virtual_makeup_upload_digest:
+            try:
+                makeup_image = ImageOps.exif_transpose(Image.open(BytesIO(upload_bytes))).convert("RGB")
+                makeup_image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+                st.session_state.virtual_makeup_image = makeup_image.copy()
+                normalized_buffer = BytesIO()
+                makeup_image.save(normalized_buffer, format="PNG", optimize=True)
+                st.session_state.virtual_makeup_image_bytes = normalized_buffer.getvalue()
+                st.session_state.virtual_makeup_upload_digest = upload_digest
+                st.session_state.virtual_makeup_preview_key = None
+                st.session_state.virtual_makeup_preview_image = None
+                st.session_state.virtual_makeup_source = uploaded_makeup_file.name
+            except Exception:
+                st.session_state.virtual_makeup_image = None
+                st.session_state.virtual_makeup_image_bytes = None
+                st.session_state.virtual_makeup_upload_digest = upload_digest
+                st.error("This image could not be opened. Please upload a valid JPG or PNG portrait.")
 
     makeup_image = st.session_state.virtual_makeup_image
     if makeup_image is None:
@@ -2048,9 +2000,7 @@ elif "Virtual Try-On & Makeup" in st.session_state.active_studio_name:
             )
             intensity = st.slider("Makeup intensity", 0, 100, value=65, key="makeup_intensity", format="%d%%")
 
-        normalized_buffer = BytesIO()
-        makeup_image.save(normalized_buffer, format="PNG", optimize=True)
-        normalized_bytes = normalized_buffer.getvalue()
+        normalized_bytes = st.session_state.virtual_makeup_image_bytes
         try:
             with st.spinner("Mapping eyes, lips, and cheeks…"):
                 makeup_points = _cached_makeup_face_points(normalized_bytes)
@@ -2058,16 +2008,28 @@ elif "Virtual Try-On & Makeup" in st.session_state.active_studio_name:
                 st.warning("No face was detected. Try a clear, front-facing portrait with even lighting.")
                 _show_image_inline(makeup_image, f"Original portrait · {st.session_state.virtual_makeup_source}")
             else:
-                makeup_preview = _virtual_makeup_preview(
-                    makeup_image,
-                    makeup_points,
-                    lipstick_shades[lipstick_name],
-                    blush_shades[blush_name],
+                preview_key = (
+                    st.session_state.virtual_makeup_upload_digest,
+                    lipstick_name,
+                    blush_name,
                     blush_placement,
-                    eyeshadow_shades[eyeshadow_name],
+                    eyeshadow_name,
                     eyeliner_style,
-                    intensity,
+                    int(intensity),
                 )
+                if st.session_state.virtual_makeup_preview_key != preview_key:
+                    st.session_state.virtual_makeup_preview_image = _virtual_makeup_preview(
+                        makeup_image,
+                        makeup_points,
+                        lipstick_shades[lipstick_name],
+                        blush_shades[blush_name],
+                        blush_placement,
+                        eyeshadow_shades[eyeshadow_name],
+                        eyeliner_style,
+                        intensity,
+                    )
+                    st.session_state.virtual_makeup_preview_key = preview_key
+                makeup_preview = st.session_state.virtual_makeup_preview_image
                 comparison = st.radio(
                     "Preview comparison",
                     ["Side-by-side", "Makeup preview", "Original photo"],
@@ -2107,21 +2069,28 @@ elif "Hairstyle & Cuts" in st.session_state.active_studio_name:
     st.markdown("""<div class="stitch-hero"><span class="stitch-pill stitch-pill-secondary">HAIR ARCHITECTURE & SILHOUETTE</span><h1 style="font-size:32px;margin:6px 0 8px;">Hairstyle Atelier</h1><p style="color:var(--color-on-surface-variant);font-size:14.5px;margin:0;">Face-shape-led hairstyle ideas with photographic references selected from the Glow AI portrait collection.</p></div>""",unsafe_allow_html=True)
     upload=st.file_uploader("Upload a front-facing portrait",type=["jpg","jpeg","png"],key=f"hair_file_{st.session_state.hair_upload_key}")
     if upload is not None:
-        try:
-            upload.seek(0); portrait=ImageOps.exif_transpose(Image.open(upload)).convert("RGB"); portrait.thumbnail((1000,1000),Image.Resampling.LANCZOS)
-            st.session_state.hair_image=portrait.copy(); st.session_state.hair_source=upload.name
-        except Exception:
-            st.session_state.hair_image=None; st.error("This image could not be opened. Choose a valid JPG or PNG portrait.")
+        upload_bytes = upload.getvalue()
+        upload_digest = hashlib.sha256(upload_bytes).hexdigest()
+        if upload_digest != st.session_state.hair_upload_digest:
+            try:
+                portrait=ImageOps.exif_transpose(Image.open(BytesIO(upload_bytes))).convert("RGB"); portrait.thumbnail((1000,1000),Image.Resampling.LANCZOS)
+                st.session_state.hair_image=portrait.copy(); st.session_state.hair_source=upload.name
+                encoded = BytesIO(); portrait.save(encoded,format="PNG",optimize=True)
+                st.session_state.hair_image_bytes=encoded.getvalue(); st.session_state.hair_upload_digest=upload_digest
+            except Exception:
+                st.session_state.hair_image=None; st.session_state.hair_image_bytes=None; st.session_state.hair_upload_digest=upload_digest
+                st.error("This image could not be opened. Choose a valid JPG or PNG portrait.")
     if st.session_state.hair_image is None and st.session_state.original_image is not None:
         if st.button("Use the portrait already analyzed in Face & Color Analysis",key="use_existing_hair_portrait"):
             st.session_state.hair_image=st.session_state.original_image.copy(); st.session_state.hair_source="Face & Color Analysis portrait"
+            encoded = BytesIO(); st.session_state.hair_image.save(encoded,format="PNG",optimize=True); st.session_state.hair_image_bytes=encoded.getvalue()
+            st.session_state.hair_upload_digest = hashlib.sha256(st.session_state.hair_image_bytes).hexdigest()
     portrait=st.session_state.hair_image
     if portrait is None:
         st.info("Upload a clear, front-facing portrait to receive three hairstyle recommendations.")
     else:
-        b=BytesIO(); portrait.save(b,format="PNG")
         try:
-            with st.spinner("Mapping facial proportions…"): points=_cached_style_face_points(b.getvalue())
+            with st.spinner("Mapping facial proportions…"): points=_cached_style_face_points(st.session_state.hair_image_bytes)
         except Exception as exc:
             points=None; st.error(f"Portrait analysis could not complete: {exc}")
         if points is None:
@@ -2161,21 +2130,28 @@ elif "Eyewear Studio" in st.session_state.active_studio_name:
     st.markdown("""<div class="stitch-hero"><span class="stitch-pill stitch-pill-secondary">OPTICAL & SUNGLASS ATELIER</span><h1 style="font-size:32px;margin:6px 0 8px;">Eyewear Studio</h1><p style="color:var(--color-on-surface-variant);font-size:14.5px;margin:0;">Personalized frame recommendations selected for your face shape, shown with frame-only product photos.</p></div>""",unsafe_allow_html=True)
     upload=st.file_uploader("Upload a front-facing portrait",type=["jpg","jpeg","png"],key=f"eyewear_file_{st.session_state.eyewear_upload_key}")
     if upload is not None:
-        try:
-            upload.seek(0); portrait=ImageOps.exif_transpose(Image.open(upload)).convert("RGB"); portrait.thumbnail((1000,1000),Image.Resampling.LANCZOS)
-            st.session_state.eyewear_image=portrait.copy(); st.session_state.eyewear_source=upload.name
-        except Exception:
-            st.session_state.eyewear_image=None; st.error("This image could not be opened. Choose a valid JPG or PNG portrait.")
+        upload_bytes = upload.getvalue()
+        upload_digest = hashlib.sha256(upload_bytes).hexdigest()
+        if upload_digest != st.session_state.eyewear_upload_digest:
+            try:
+                portrait=ImageOps.exif_transpose(Image.open(BytesIO(upload_bytes))).convert("RGB"); portrait.thumbnail((1000,1000),Image.Resampling.LANCZOS)
+                st.session_state.eyewear_image=portrait.copy(); st.session_state.eyewear_source=upload.name
+                encoded = BytesIO(); portrait.save(encoded,format="PNG",optimize=True)
+                st.session_state.eyewear_image_bytes=encoded.getvalue(); st.session_state.eyewear_upload_digest=upload_digest
+            except Exception:
+                st.session_state.eyewear_image=None; st.session_state.eyewear_image_bytes=None; st.session_state.eyewear_upload_digest=upload_digest
+                st.error("This image could not be opened. Choose a valid JPG or PNG portrait.")
     if st.session_state.eyewear_image is None and st.session_state.original_image is not None:
         if st.button("Use the portrait already analyzed in Face & Color Analysis",key="use_existing_eyewear_portrait"):
             st.session_state.eyewear_image=st.session_state.original_image.copy(); st.session_state.eyewear_source="Face & Color Analysis portrait"
+            encoded = BytesIO(); st.session_state.eyewear_image.save(encoded,format="PNG",optimize=True); st.session_state.eyewear_image_bytes=encoded.getvalue()
+            st.session_state.eyewear_upload_digest = hashlib.sha256(st.session_state.eyewear_image_bytes).hexdigest()
     portrait=st.session_state.eyewear_image
     if portrait is None:
         st.info("Upload a clear, front-facing portrait to receive personalized frame recommendations.")
     else:
-        b=BytesIO(); portrait.save(b,format="PNG")
         try:
-            with st.spinner("Mapping eye corners and nose bridge…"): points=_cached_style_face_points(b.getvalue())
+            with st.spinner("Mapping eye corners and nose bridge…"): points=_cached_style_face_points(st.session_state.eyewear_image_bytes)
         except Exception as exc:
             points=None; st.error(f"Portrait analysis could not complete: {exc}")
         if points is None:
