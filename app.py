@@ -1726,6 +1726,46 @@ if "Overview / Studio" in st.session_state.active_studio_name:
                 if st.button("🗑️ Remove Photo / Choose Another", use_container_width=True, key="btn_remove_staged_photo"):
                     reset_all_visage_state()
                     st.rerun()
+        else:
+            st.markdown(
+                """
+                <div style="margin: 22px 0 10px 0;">
+                    <span class="stitch-pill stitch-pill-active">✦ PORTRAIT INSPECTION & PREVIEW</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            prev_col1, prev_col2 = st.columns([1, 1.3], gap="large")
+            with prev_col1:
+                st.markdown(
+                    """
+                    <figure style="margin:0;width:100%;padding:12px;border:1px solid #d7c1c3;border-radius:20px;background:#fff;box-shadow:0 8px 24px rgba(136,74,82,0.08);box-sizing:border-box;">
+                        <div style="width:100%;aspect-ratio:4/5;min-height:300px;max-height:640px;display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:12px;background:linear-gradient(155deg,#fff9fa 0%,#f8e9ec 100%);">
+                            <svg viewBox="0 0 280 350" role="img" aria-label="Minimal front-facing face outline placeholder" style="width:78%;height:78%;max-width:290px;max-height:360px;">
+                                <path d="M140 38 C91 38 60 75 60 132 C60 198 91 249 140 267 C189 249 220 198 220 132 C220 75 189 38 140 38Z" fill="rgba(255,255,255,0.34)" stroke="#c47c85" stroke-width="3" stroke-linecap="round"/>
+                                <path d="M60 125 C48 115 45 135 53 153 M220 125 C232 115 235 135 227 153" fill="none" stroke="#d7a3aa" stroke-width="3" stroke-linecap="round"/>
+                                <path d="M106 132 Q121 124 132 132 M148 132 Q159 124 174 132 M140 135 C136 158 132 171 140 175 M123 199 Q140 207 157 199" fill="none" stroke="#d7a3aa" stroke-width="2.5" stroke-linecap="round"/>
+                                <path d="M112 267 L108 292 Q140 309 172 292 L168 267 M108 292 Q81 301 68 323 M172 292 Q199 301 212 323" fill="none" stroke="#c47c85" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+                                <path d="M76 322 Q140 302 204 322" fill="none" stroke="#e2bdc2" stroke-width="3" stroke-linecap="round"/>
+                            </svg>
+                        </div>
+                    </figure>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with prev_col2:
+                st.markdown(
+                    """
+                    <div class="stitch-card" style="min-height:300px;display:flex;flex-direction:column;justify-content:center;">
+                        <span class="stitch-pill stitch-pill-secondary">YOUR PORTRAIT</span>
+                        <h3 style="margin:12px 0 8px 0;font-size:24px;">Your portrait preview will appear here</h3>
+                        <p style="font-size:13.5px;color:var(--color-on-surface-variant);line-height:1.55;margin:0;">
+                            Upload a clear, front-facing portrait with your full face visible and even lighting. You can also capture a live selfie or try the studio sample above.
+                        </p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
     else:
         st.markdown(
             """
